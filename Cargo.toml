@@ -33,6 +33,8 @@ embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driv
 cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10.0", features = ["defmt"] }
 static_cell = "2.1.1"
+sntpc = { version = "0.11.0", features = ["defmt"] }
+apds9960 = "0.1.0"
 
 [profile.release]
 debug = 2
