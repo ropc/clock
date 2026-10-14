@@ -1,19 +1,23 @@
 #![no_std]
 #![no_main]
 
-use cyw43::{JoinOptions, aligned_bytes};
+use core::cell::RefCell;
+
+use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_net::{Config, StackResources};
+use embassy_net::{Config, Stack, StackResources};
 use embassy_rp::{
-    bind_interrupts, dma,
-    clocks::RoscRng,
-    gpio::{Level, Output},
-    peripherals::{DMA_CH0, PIO0},
-    pio::{InterruptHandler, Pio},
+    bind_interrupts, clocks::RoscRng, dma,
+    gpio::{Level, Output}, i2c::{self, I2c},
+    peripherals::{DMA_CH0, I2C0, PIO0},
+    pio::{self, Pio},
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, Delay};
+use embedded_hal_bus::i2c::RefCellDevice;
+use periph::chips::light::Apds9960Full;
+use four_letter_phat_rs::{Dimming, Display, FourLetterPhat};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -21,9 +25,13 @@ const NETWORK_SSID: &str = env!("NETWORK_SSID");
 const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
 
 bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+    I2C0_IRQ => i2c::InterruptHandler<I2C0>;
 });
+
+static I2C_STATIC_CELL: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
+static I2C_REF_CELL: StaticCell<RefCell<&mut I2c<'static, I2C0, i2c::Async>>> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
@@ -73,30 +81,29 @@ async fn main(spawner: Spawner) -> ! {
 
     // Init network stack
     static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
-    let (stack, runner) = embassy_net::new(net_device, config, RESOURCES.init(StackResources::new()), seed);
+    let (stack, runner) = embassy_net::new(
+        net_device,
+        config,
+        RESOURCES.init(StackResources::new()),
+        seed,
+    );
 
     unwrap!(spawner.spawn(net_task(runner)));
+    unwrap!(spawner.spawn(time_sync_task(control, stack)));
 
-    while let Err(err) = control
-        .join(NETWORK_SSID, JoinOptions::new(NETWORK_PASSWORD.as_bytes()))
-        .await
-    {
-        info!("join failed: {:?}", err);
-    }
+    let scl = p.PIN_13;
+    let sda = p.PIN_12;
 
-    info!("waiting for link...");
-    stack.wait_link_up().await;
+    let i2c = I2C_STATIC_CELL.init(I2c::new_async(p.I2C0, scl, sda, Irqs, Default::default()));
+    let i2c_ref_cell = I2C_REF_CELL.init(RefCell::new(i2c));
 
-    info!("waiting for DHCP...");
-    stack.wait_config_up().await;
+    let mut delay = Delay {};
+    let sensor = Apds9960Full::new(RefCellDevice::new(i2c_ref_cell), 0x39, &mut delay).unwrap();
+    let display = FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x70).unwrap();
 
-    // And now we can use it!
-    info!("Stack is up!");
+    unwrap!(spawner.spawn(display_task(display)));
 
-    loop {
-        defmt::info!("Blink");
-        Timer::after(Duration::from_millis(1000)).await;
-    }
+    human_interface_task(sensor).await;
 }
 
 #[embassy_executor::task]
@@ -109,4 +116,77 @@ async fn cyw43_task(
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
+    loop {
+        while let Err(err) = control
+            .join(NETWORK_SSID, JoinOptions::new(NETWORK_PASSWORD.as_bytes()))
+            .await
+        {
+            info!("join failed: {:?}", err);
+        }
+
+        info!("waiting for link...");
+        stack.wait_link_up().await;
+
+        info!("waiting for DHCP...");
+        stack.wait_config_up().await;
+
+        // And now we can use it!
+        info!("Stack is up!");
+
+        loop {
+            Timer::after_secs(10).await;
+            info!("network still up: {}", stack.is_link_up());
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
+    let mut set_decimal = true;
+    loop {
+        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
+        display.set_digit(0, '0').unwrap();
+        display.set_digit(1, '1').unwrap();
+
+        display.set_digit(2, '2').unwrap();
+        display.set_digit(3, '3').unwrap();
+        
+        if set_decimal {
+            display.set_decimal(1).unwrap();
+        } else {
+            display.clear_decimal(1).unwrap();
+        }
+
+        Timer::after_secs(1).await;
+        set_decimal = !set_decimal;
+    }
+}
+// #[embassy_executor::task]
+async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2c<'_, I2C0, i2c::Async>>>) -> ! {
+    // TODO: implement time-sharing bc gesture engine and ambient light detection
+    // use the same hardware components
+
+    // sensor.enable_gesture(true).unwrap();
+    // sensor.enable_gesture_interrupt(true).unwrap();
+
+    sensor.enable_proximity(true).unwrap();
+    sensor.enable_proximity_interrupt(true).unwrap();
+
+    loop {
+        // defmt::info!("Blink");
+        // Timer::after(Duration::from_millis(20)).await;
+        Timer::after(Duration::from_millis(100)).await;
+
+        let mut gesture_data_buf = [(0, 0, 0, 0); 1];
+        
+        let gesture_data = sensor.read_gesture_fifo(&mut gesture_data_buf).map_or_default(|_| Option::Some(gesture_data_buf));
+        let proximity_data = sensor.proximity().unwrap_or_default();
+        let light_data = sensor.color_clear().map_or_default(|level| Option::Some(level));
+        
+        defmt::info!("gesture: {:?}\tprox: {:?}\tlight: {:?}", gesture_data, proximity_data, light_data);
+    }
 }

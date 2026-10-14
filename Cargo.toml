@@ -17,6 +17,7 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
+embedded-hal-bus = { version =  "0.3.0", features = ["async", "defmt-03"] }
 embedded-io = "0.7"
 embedded-io-async = "0.7"
 embedded-storage = "0.3.1"
@@ -34,7 +35,8 @@ cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10.0", features = ["defmt"] }
 static_cell = "2.1.1"
 sntpc = { version = "0.11.0", features = ["defmt"] }
-apds9960 = "0.1.0"
+periph = "1.2.1"
+four-letter-phat-rs = "0.2.0"
 
 [profile.release]
 debug = 2
