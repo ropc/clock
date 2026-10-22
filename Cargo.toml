@@ -29,7 +29,7 @@ embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"]
 embassy-net = { version = "0.9", features = ["defmt", "icmp", "dhcpv4", "tcp", "udp", "dns", "proto-ipv4", "medium-ethernet" ] }
 
 cortex-m = { version = "0.7.7" }
-embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa"] }
+embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp235xa", "chrono"] }
 
 cyw43 = { version = "0.7.0", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { version = "0.10.0", features = ["defmt"] }
@@ -37,6 +37,8 @@ static_cell = "2.1.1"
 sntpc = { version = "0.11.0", features = ["defmt"] }
 periph = "1.2.1"
 four-letter-phat-rs = "0.2.0"
+chrono = { version = "0.4.45", default-features = false }
+chrono-tz = { version = "0.5", default-features = false }
 
 [profile.release]
 debug = 2

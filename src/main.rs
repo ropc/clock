@@ -14,7 +14,8 @@ use embassy_rp::{
     peripherals::{DMA_CH0, I2C0, PIO0},
     pio::{self, Pio},
 };
-use embassy_time::{Duration, Timer, Delay};
+use embassy_time::{Delay, Duration, Instant, Timer};
+use chrono::{DateTime, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
 use four_letter_phat_rs::{Dimming, Display, FourLetterPhat};
@@ -101,6 +102,8 @@ async fn main(spawner: Spawner) -> ! {
     let sensor = Apds9960Full::new(RefCellDevice::new(i2c_ref_cell), 0x39, &mut delay).unwrap();
     let display = FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x70).unwrap();
 
+    
+
     unwrap!(spawner.spawn(display_task(display)));
 
     human_interface_task(sensor).await;
@@ -144,16 +147,45 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
     }
 }
 
+fn to_char(num: u32) -> char {
+    // defmt::info!("converting {} to char", num);
+    match num {
+        1 => '1',
+        2 => '2',
+        3 => '3',
+        4 => '4',
+        5 => '5',
+        6 => '6',
+        7 => '7',
+        8 => '8',
+        9 => '9',
+        _ => '0',
+    }
+}
+
 #[embassy_executor::task]
 async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
     let mut set_decimal = true;
-    loop {
-        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
-        display.set_digit(0, '0').unwrap();
-        display.set_digit(1, '1').unwrap();
+    // TODO: since display.set_digit() clears the display before setting the new one, there is a
+    // flicker when updating the display, since it goes display '0' -> blank -> display '1'
+    // a hacky solution would be to keep previous state and only change the digits that are needed
+    // a better solution would be to figure out the minimum segment change for the digit and execute those
 
-        display.set_digit(2, '2').unwrap();
-        display.set_digit(3, '3').unwrap();
+    // let start = Instant::now();
+    let offset: u64 = 1792679109000;
+    loop {
+        let now = Instant::now().as_millis() + offset;
+        let now = DateTime::from_timestamp_millis(now.try_into().unwrap()).unwrap();
+        let now = now.with_timezone(&chrono_tz::US::Eastern);
+
+        // defmt::info!("now is {}", now);
+
+        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
+        display.set_digit(0, to_char(now.hour() / 10)).unwrap();
+        display.set_digit(1, to_char(now.hour() % 10)).unwrap();
+
+        display.set_digit(2, to_char(now.minute() / 10)).unwrap();
+        display.set_digit(3, to_char(now.minute() % 10)).unwrap();
         
         if set_decimal {
             display.set_decimal(1).unwrap();
@@ -187,6 +219,6 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
         let proximity_data = sensor.proximity().unwrap_or_default();
         let light_data = sensor.color_clear().map_or_default(|level| Option::Some(level));
         
-        defmt::info!("gesture: {:?}\tprox: {:?}\tlight: {:?}", gesture_data, proximity_data, light_data);
+        // defmt::info!("gesture: {:?}\tprox: {:?}\tlight: {:?}", gesture_data, proximity_data, light_data);
     }
 }
