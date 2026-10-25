@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
 
-use core::{cell::RefCell, net::{IpAddr, SocketAddr}, ops::Add, str::FromStr};
+use core::{cell::RefCell, net::{IpAddr, SocketAddr}, str::FromStr};
 
 use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_net::{Config, Stack, StackResources, dns::DnsQueryType, udp::PacketMetadata};
 use embassy_rp::{
     bind_interrupts, clocks::RoscRng, dma,
@@ -16,8 +16,8 @@ use embassy_rp::{
     pio::{self, Pio},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, watch::Watch};
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
-use chrono::{DateTime, TimeDelta, Timelike};
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer };
+use chrono::{DateTime, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
 use four_letter_phat_rs::FourLetterPhat;
@@ -233,7 +233,7 @@ fn to_char(num: u32) -> char {
 async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
     let mut set_decimal = true;
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
-    let mut wakeup_timeout: Option<DateTime<chrono::Utc>> = None;
+    let mut wakeup_timeout: Option<u64> = None;
     let mut clock_state_receiver = CLOCK_STATE.receiver().unwrap();
     let mut ticker = Ticker::every(Duration::from_secs(1));
 
@@ -241,14 +241,20 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
     display.set_decimal(0).unwrap();
 
     loop {
-        let state = match select(clock_state_receiver.changed(), ticker.next()).await {
-            Either::First(state) => state,
-            Either::Second(_) => {
+        let state = match select3(clock_state_receiver.changed(), ticker.next(), WAKEUP_SIGNAL.wait()).await {
+            Either3::First(state) => state,
+            Either3::Second(_) => {
                 set_decimal = !set_decimal;
                 clock_state_receiver.get().await
             },
+            Either3::Third(_) => {
+                info!("wakeup received");
+                // timeout 3 seconds from now
+                wakeup_timeout = Some(Instant::now().as_micros() + 3_000_000);
+                clock_state_receiver.get().await
+            },
         };
-        
+
         match state {
             ClockState::PoweredOn => {
                 display.clear_digit(0).unwrap();
@@ -271,12 +277,7 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
                 display.clear_decimal(3).unwrap();
             },
             ClockState::TimeSynced(offset) => {
-                let now = Instant::now().as_micros() + offset;
-                let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
-
-                if WAKEUP_SIGNAL.try_take().is_some() {
-                    wakeup_timeout = Some(now.add(TimeDelta::seconds(3)));
-                }
+                let now = Instant::now().as_micros();
 
                 display.clear_decimal(0).unwrap();
                 display.clear_decimal(2).unwrap();
@@ -300,6 +301,7 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
 
                     },
                     AmbientLightState::BRIGHT => {
+                        let now = DateTime::from_timestamp_micros((now + offset).try_into().unwrap()).unwrap();
                         let now = now.with_timezone(&timezone);
 
                         // defmt::info!("now is {}", now);
@@ -335,6 +337,7 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
     // sensor.enable_proximity_interrupt(true).unwrap();
 
     let mut ambient_light_dark_count = 0;
+    let mut wakeup_signaled = false;
 
     loop {
         // defmt::info!("Blink");
@@ -349,8 +352,14 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
 
         // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
 
-        if let Some(value) = proximity_data && value > 0 && !WAKEUP_SIGNAL.signaled() {
-            WAKEUP_SIGNAL.signal(());
+        if let Some(value) = proximity_data {
+            if value > 0 && !wakeup_signaled {
+                WAKEUP_SIGNAL.signal(());
+                wakeup_signaled = true;
+            }
+            if value == 0 && wakeup_signaled {
+                wakeup_signaled = false;
+            }
         }
 
         if let Some(value) = light_data && value < AMBIENT_LIGHT_THRESHOLD {
