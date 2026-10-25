@@ -214,10 +214,6 @@ fn to_char(num: u32) -> char {
 async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
     let mut set_decimal = true;
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
-    // TODO: since display.set_digit() clears the display before setting the new one, there is a
-    // flicker when updating the display, since it goes display '0' -> blank -> display '1'
-    // a hacky solution would be to keep previous state and only change the digits that are needed
-    // a better solution would be to figure out the minimum segment change for the digit and execute those
 
     loop {
         let Some(offset) = TIME_OFFSET_WATCH.receiver().unwrap().try_get() else {

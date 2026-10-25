@@ -854,8 +854,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "four-letter-phat-rs"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce42974478794e8ef3335fee273837a7fff01bab9ea514fa8aa006e128a730c"
+source = "git+https://gitlab.com/ropc/four-letter-phat-rs#db02fdb5eea4d5002544c606189974b11f622257"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-compat",
