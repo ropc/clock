@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::{cell::RefCell, net::{IpAddr, SocketAddr}, str::FromStr};
+use core::{cell::RefCell, net::{IpAddr, SocketAddr}, ops::Add, str::FromStr};
 
 use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
@@ -14,9 +14,9 @@ use embassy_rp::{
     peripherals::{DMA_CH0, I2C0, PIO0},
     pio::{self, Pio},
 };
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, watch::Watch};
 use embassy_time::{Delay, Instant, Timer};
-use chrono::{DateTime, Timelike};
+use chrono::{DateTime, Duration, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
 use four_letter_phat_rs::FourLetterPhat;
@@ -45,6 +45,7 @@ static I2C_STATIC_CELL: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell:
 static I2C_REF_CELL: StaticCell<RefCell<&mut I2c<'static, I2C0, i2c::Async>>> = StaticCell::new();
 static TIME_OFFSET_WATCH: Watch<CriticalSectionRawMutex, u64, 1> = Watch::new();
 static AMBIENT_LIGHT_STATE: Watch<CriticalSectionRawMutex, AmbientLightState, 2> = Watch::new();
+static WAKEUP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[derive(Debug, Format, Clone, Copy, Default, PartialEq, Eq)]
 enum AmbientLightState {
@@ -223,6 +224,7 @@ fn to_char(num: u32) -> char {
 async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
     let mut set_decimal = true;
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
+    let mut wakeup_timeout: Option<DateTime<chrono::Utc>> = None;
 
     loop {
         let Some(offset) = TIME_OFFSET_WATCH.receiver().unwrap().try_get() else {
@@ -230,7 +232,20 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
             continue;
         };
 
-        let ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+        let now = Instant::now().as_micros() + offset;
+        let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
+
+        if WAKEUP_SIGNAL.try_take().is_some() {
+            wakeup_timeout = Some(now.add(Duration::seconds(3)));
+        }
+
+        let ambient_light;
+        if let Some(timeout) = wakeup_timeout && now < timeout {
+            ambient_light = AmbientLightState::BRIGHT;
+        } else {
+            wakeup_timeout = None;
+            ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+        }
 
         match ambient_light {
             AmbientLightState::DARK => {
@@ -241,8 +256,6 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
                 display.clear_digit(3).unwrap();
             },
             AmbientLightState::BRIGHT => {
-                let now = Instant::now().as_micros() + offset;
-                let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
                 let now = now.with_timezone(&timezone);
 
                 // defmt::info!("now is {}", now);
@@ -292,6 +305,10 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
         let light_data = sensor.color_clear().ok();
 
         // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
+
+        if let Some(value) = proximity_data && value > 0 && !WAKEUP_SIGNAL.signaled() {
+            WAKEUP_SIGNAL.signal(());
+        }
 
         if let Some(value) = light_data && value < AMBIENT_LIGHT_THRESHOLD {
             // prevent overflows
