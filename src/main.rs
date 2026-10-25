@@ -7,6 +7,7 @@ use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{Config, Stack, StackResources, dns::DnsQueryType, udp::PacketMetadata};
 use embassy_rp::{
     bind_interrupts, clocks::RoscRng, dma,
@@ -15,8 +16,8 @@ use embassy_rp::{
     pio::{self, Pio},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, watch::Watch};
-use embassy_time::{Delay, Instant, Timer};
-use chrono::{DateTime, Duration, Timelike};
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
+use chrono::{DateTime, TimeDelta, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
 use four_letter_phat_rs::FourLetterPhat;
@@ -43,7 +44,7 @@ bind_interrupts!(struct Irqs {
 
 static I2C_STATIC_CELL: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
 static I2C_REF_CELL: StaticCell<RefCell<&mut I2c<'static, I2C0, i2c::Async>>> = StaticCell::new();
-static TIME_OFFSET_WATCH: Watch<CriticalSectionRawMutex, u64, 1> = Watch::new();
+static CLOCK_STATE: Watch<CriticalSectionRawMutex, ClockState, 1> = Watch::new_with(ClockState::PoweredOn);
 static AMBIENT_LIGHT_STATE: Watch<CriticalSectionRawMutex, AmbientLightState, 2> = Watch::new();
 static WAKEUP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -52,6 +53,13 @@ enum AmbientLightState {
     #[default]
     BRIGHT,
     DARK,
+}
+
+#[derive(Debug, Format, Clone, Copy)]
+enum ClockState {
+    PoweredOn,
+    WifiConnected,
+    TimeSynced(u64),  // stores offset
 }
 
 #[derive(Error, Debug, Format)]
@@ -155,17 +163,18 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
             .await
         {
             info!("join failed: {:?}", err);
-            Timer::after_secs(2).await;
+            Timer::after_secs(1).await;
         }
 
         info!("waiting for link...");
         stack.wait_link_up().await;
-
+        
         info!("waiting for DHCP...");
         stack.wait_config_up().await;
-
+        
         // And now we can use it!
         info!("Stack is up!");
+        CLOCK_STATE.sender().send(ClockState::WifiConnected);
 
         loop {
             let mut rx_meta = [PacketMetadata::EMPTY; 16];
@@ -192,8 +201,8 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
 
             match result {
                 Ok(time) => {
-                    TIME_OFFSET_WATCH.sender().send(time.offset().try_into().expect("ntp offset should be positive"));
                     info!("time is {}", time);
+                    CLOCK_STATE.sender().send(ClockState::TimeSynced(time.offset().try_into().expect("ntp offset should be positive")));
                 },
                 Err(e) => error!("ntp error: {}", e),
             };
@@ -225,58 +234,92 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
     let mut set_decimal = true;
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
     let mut wakeup_timeout: Option<DateTime<chrono::Utc>> = None;
+    let mut clock_state_receiver = CLOCK_STATE.receiver().unwrap();
+    let mut ticker = Ticker::every(Duration::from_secs(1));
+
+    // show that display is powered on
+    display.set_decimal(0).unwrap();
 
     loop {
-        let Some(offset) = TIME_OFFSET_WATCH.receiver().unwrap().try_get() else {
-            Timer::after_secs(1).await;
-            continue;
+        let state = match select(clock_state_receiver.changed(), ticker.next()).await {
+            Either::First(state) => state,
+            Either::Second(_) => {
+                set_decimal = !set_decimal;
+                clock_state_receiver.get().await
+            },
         };
-
-        let now = Instant::now().as_micros() + offset;
-        let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
-
-        if WAKEUP_SIGNAL.try_take().is_some() {
-            wakeup_timeout = Some(now.add(Duration::seconds(3)));
-        }
-
-        let ambient_light;
-        if let Some(timeout) = wakeup_timeout && now < timeout {
-            ambient_light = AmbientLightState::BRIGHT;
-        } else {
-            wakeup_timeout = None;
-            ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
-        }
-
-        match ambient_light {
-            AmbientLightState::DARK => {
+        
+        match state {
+            ClockState::PoweredOn => {
                 display.clear_digit(0).unwrap();
                 display.clear_digit(1).unwrap();
-                display.clear_decimal(1).unwrap();
                 display.clear_digit(2).unwrap();
                 display.clear_digit(3).unwrap();
+                display.set_decimal(0).unwrap();
+                display.clear_decimal(1).unwrap();
+                display.clear_decimal(2).unwrap();
+                display.clear_decimal(3).unwrap();
             },
-            AmbientLightState::BRIGHT => {
-                let now = now.with_timezone(&timezone);
+            ClockState::WifiConnected => {
+                display.clear_digit(0).unwrap();
+                display.clear_digit(1).unwrap();
+                display.clear_digit(2).unwrap();
+                display.clear_digit(3).unwrap();
+                display.set_decimal(0).unwrap();
+                display.set_decimal(1).unwrap();
+                display.clear_decimal(2).unwrap();
+                display.clear_decimal(3).unwrap();
+            },
+            ClockState::TimeSynced(offset) => {
+                let now = Instant::now().as_micros() + offset;
+                let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
 
-                // defmt::info!("now is {}", now);
-
-                // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
-                display.set_digit(0, to_char(now.hour() / 10)).unwrap();
-                display.set_digit(1, to_char(now.hour() % 10)).unwrap();
-
-                display.set_digit(2, to_char(now.minute() / 10)).unwrap();
-                display.set_digit(3, to_char(now.minute() % 10)).unwrap();
-
-                if set_decimal {
-                    display.set_decimal(1).unwrap();
-                } else {
-                    display.clear_decimal(1).unwrap();
+                if WAKEUP_SIGNAL.try_take().is_some() {
+                    wakeup_timeout = Some(now.add(TimeDelta::seconds(3)));
                 }
-                set_decimal = !set_decimal;
+
+                display.clear_decimal(0).unwrap();
+                display.clear_decimal(2).unwrap();
+                display.clear_decimal(3).unwrap();
+
+                let ambient_light;
+                if let Some(timeout) = wakeup_timeout && now < timeout {
+                    ambient_light = AmbientLightState::BRIGHT;
+                } else {
+                    wakeup_timeout = None;
+                    ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+                }
+
+                match ambient_light {
+                    AmbientLightState::DARK => {
+                        display.clear_digit(0).unwrap();
+                        display.clear_digit(1).unwrap();
+                        display.clear_decimal(1).unwrap();
+                        display.clear_digit(2).unwrap();
+                        display.clear_digit(3).unwrap();
+
+                    },
+                    AmbientLightState::BRIGHT => {
+                        let now = now.with_timezone(&timezone);
+
+                        // defmt::info!("now is {}", now);
+
+                        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
+                        display.set_digit(0, to_char(now.hour() / 10)).unwrap();
+                        display.set_digit(1, to_char(now.hour() % 10)).unwrap();
+
+                        display.set_digit(2, to_char(now.minute() / 10)).unwrap();
+                        display.set_digit(3, to_char(now.minute() % 10)).unwrap();
+
+                        if set_decimal {
+                            display.set_decimal(1).unwrap();
+                        } else {
+                            display.clear_decimal(1).unwrap();
+                        }
+                    }
+                }
             }
         }
-
-        Timer::after_secs(1).await;
     }
 }
 

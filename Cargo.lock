@@ -195,6 +195,7 @@ dependencies = [
  "defmt 1.1.1",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-net",
  "embassy-rp",
  "embassy-sync",
