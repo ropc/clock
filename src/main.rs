@@ -15,7 +15,7 @@ use embassy_rp::{
     pio::{self, Pio},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
-use embassy_time::{Delay, Duration, Instant, Timer};
+use embassy_time::{Delay, Instant, Timer};
 use chrono::{DateTime, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
@@ -33,6 +33,7 @@ const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
 const TIMEZONE: &str = env!("TIMEZONE");
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
+const AMBIENT_LIGHT_THRESHOLD: u16 = 10;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -43,6 +44,14 @@ bind_interrupts!(struct Irqs {
 static I2C_STATIC_CELL: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
 static I2C_REF_CELL: StaticCell<RefCell<&mut I2c<'static, I2C0, i2c::Async>>> = StaticCell::new();
 static TIME_OFFSET_WATCH: Watch<CriticalSectionRawMutex, u64, 1> = Watch::new();
+static AMBIENT_LIGHT_STATE: Watch<CriticalSectionRawMutex, AmbientLightState, 2> = Watch::new();
+
+#[derive(Debug, Format, Clone, Copy, Default, PartialEq, Eq)]
+enum AmbientLightState {
+    #[default]
+    BRIGHT,
+    DARK,
+}
 
 #[derive(Error, Debug, Format)]
 enum AppError {
@@ -220,27 +229,41 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
             Timer::after_secs(1).await;
             continue;
         };
-        let now = Instant::now().as_micros() + offset;
-        let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
-        let now = now.with_timezone(&timezone);
 
-        // defmt::info!("now is {}", now);
+        let ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
 
-        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
-        display.set_digit(0, to_char(now.hour() / 10)).unwrap();
-        display.set_digit(1, to_char(now.hour() % 10)).unwrap();
+        match ambient_light {
+            AmbientLightState::DARK => {
+                display.clear_digit(0).unwrap();
+                display.clear_digit(1).unwrap();
+                display.clear_decimal(1).unwrap();
+                display.clear_digit(2).unwrap();
+                display.clear_digit(3).unwrap();
+            },
+            AmbientLightState::BRIGHT => {
+                let now = Instant::now().as_micros() + offset;
+                let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
+                let now = now.with_timezone(&timezone);
 
-        display.set_digit(2, to_char(now.minute() / 10)).unwrap();
-        display.set_digit(3, to_char(now.minute() % 10)).unwrap();
-        
-        if set_decimal {
-            display.set_decimal(1).unwrap();
-        } else {
-            display.clear_decimal(1).unwrap();
+                // defmt::info!("now is {}", now);
+
+                // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
+                display.set_digit(0, to_char(now.hour() / 10)).unwrap();
+                display.set_digit(1, to_char(now.hour() % 10)).unwrap();
+
+                display.set_digit(2, to_char(now.minute() / 10)).unwrap();
+                display.set_digit(3, to_char(now.minute() % 10)).unwrap();
+
+                if set_decimal {
+                    display.set_decimal(1).unwrap();
+                } else {
+                    display.clear_decimal(1).unwrap();
+                }
+                set_decimal = !set_decimal;
+            }
         }
 
         Timer::after_secs(1).await;
-        set_decimal = !set_decimal;
     }
 }
 
@@ -253,19 +276,35 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
     // sensor.enable_gesture_interrupt(true).unwrap();
 
     sensor.enable_proximity(true).unwrap();
-    sensor.enable_proximity_interrupt(true).unwrap();
+    // sensor.enable_proximity_interrupt(true).unwrap();
+
+    let mut ambient_light_dark_count = 0;
 
     loop {
         // defmt::info!("Blink");
         // Timer::after(Duration::from_millis(20)).await;
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after_millis(50).await;
 
         let mut gesture_data_buf = [(0, 0, 0, 0); 1];
         
-        let gesture_data = sensor.read_gesture_fifo(&mut gesture_data_buf).map_or_default(|_| Option::Some(gesture_data_buf));
-        let proximity_data = sensor.proximity().unwrap_or_default();
-        let light_data = sensor.color_clear().map_or_default(|level| Option::Some(level));
-        
-        // defmt::info!("gesture: {:?}\tprox: {:?}\tlight: {:?}", gesture_data, proximity_data, light_data);
+        let gesture_data = sensor.read_gesture_fifo(&mut gesture_data_buf).ok();
+        let proximity_data = sensor.proximity().ok();
+        let light_data = sensor.color_clear().ok();
+
+        // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
+
+        if let Some(value) = light_data && value < AMBIENT_LIGHT_THRESHOLD {
+            // prevent overflows
+            ambient_light_dark_count = i32::max(ambient_light_dark_count + 1, 20);
+        } else {
+            ambient_light_dark_count = 0;
+        }
+
+        let new_state = if ambient_light_dark_count >= 20 { AmbientLightState::DARK } else { AmbientLightState::BRIGHT };
+        let current_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+
+        if new_state != current_state {
+            AMBIENT_LIGHT_STATE.sender().send(new_state);
+        }
     }
 }
