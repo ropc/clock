@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::{cell::RefCell, net::{IpAddr, SocketAddr}};
+use core::{cell::RefCell, net::{IpAddr, SocketAddr}, str::FromStr};
 
 use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
@@ -30,7 +30,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 const NETWORK_SSID: &str = env!("NETWORK_SSID");
 const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
-const NTP_SERVER: &str = "us.pool.ntp.org";
+const TIMEZONE: &str = env!("TIMEZONE");
+const NTP_SERVER: &str = "pool.ntp.org";
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -211,6 +212,7 @@ fn to_char(num: u32) -> char {
 #[embassy_executor::task]
 async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
     let mut set_decimal = true;
+    let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
     // TODO: since display.set_digit() clears the display before setting the new one, there is a
     // flicker when updating the display, since it goes display '0' -> blank -> display '1'
     // a hacky solution would be to keep previous state and only change the digits that are needed
@@ -223,7 +225,7 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
         };
         let now = Instant::now().as_micros() + offset;
         let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
-        let now = now.with_timezone(&chrono_tz::US::Eastern);
+        let now = now.with_timezone(&timezone);
 
         // defmt::info!("now is {}", now);
 
