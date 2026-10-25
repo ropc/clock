@@ -32,6 +32,7 @@ const NETWORK_SSID: &str = env!("NETWORK_SSID");
 const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
 const TIMEZONE: &str = env!("TIMEZONE");
 const NTP_SERVER: &str = "pool.ntp.org";
+const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -187,7 +188,7 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
                 Err(e) => error!("ntp error: {}", e),
             };
 
-            Timer::after_secs(60 * 60 * 12).await;
+            Timer::after_secs(NTP_SYNC_DELAY_SECONDS).await;
             info!("network still up: {}", stack.is_link_up());
         }
     }
