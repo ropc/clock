@@ -1,29 +1,36 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+use core::{cell::RefCell, net::{IpAddr, SocketAddr}};
 
 use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_net::{Config, Stack, StackResources};
+use embassy_net::{Config, Stack, StackResources, dns::DnsQueryType, udp::PacketMetadata};
 use embassy_rp::{
     bind_interrupts, clocks::RoscRng, dma,
     gpio::{Level, Output}, i2c::{self, I2c},
     peripherals::{DMA_CH0, I2C0, PIO0},
     pio::{self, Pio},
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embassy_time::{Delay, Duration, Instant, Timer};
 use chrono::{DateTime, Timelike};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
-use four_letter_phat_rs::{Dimming, Display, FourLetterPhat};
+use four_letter_phat_rs::FourLetterPhat;
+use sntpc::{NtpContext, get_time};
+use sntpc_net_embassy::UdpSocketWrapper;
+use sntpc_time_embassy::EmbassyTimestampGenerator;
+use embassy_net::udp::UdpSocket;
+use thiserror::Error;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 const NETWORK_SSID: &str = env!("NETWORK_SSID");
 const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
+const NTP_SERVER: &str = "us.pool.ntp.org";
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -33,6 +40,15 @@ bind_interrupts!(struct Irqs {
 
 static I2C_STATIC_CELL: StaticCell<I2c<'static, I2C0, i2c::Async>> = StaticCell::new();
 static I2C_REF_CELL: StaticCell<RefCell<&mut I2c<'static, I2C0, i2c::Async>>> = StaticCell::new();
+static TIME_OFFSET_WATCH: Watch<CriticalSectionRawMutex, u64, 1> = Watch::new();
+
+#[derive(Error, Debug, Format)]
+enum AppError {
+    #[error("Empty DNS response")]
+    EMPTY_DNS,
+    #[error("DNS error")]
+    DNS_ERROR(embassy_net::dns::Error),
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) -> ! {
@@ -102,8 +118,6 @@ async fn main(spawner: Spawner) -> ! {
     let sensor = Apds9960Full::new(RefCellDevice::new(i2c_ref_cell), 0x39, &mut delay).unwrap();
     let display = FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x70).unwrap();
 
-    
-
     unwrap!(spawner.spawn(display_task(display)));
 
     human_interface_task(sensor).await;
@@ -129,6 +143,7 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
             .await
         {
             info!("join failed: {:?}", err);
+            Timer::after_secs(2).await;
         }
 
         info!("waiting for link...");
@@ -141,7 +156,37 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
         info!("Stack is up!");
 
         loop {
-            Timer::after_secs(10).await;
+            let mut rx_meta = [PacketMetadata::EMPTY; 16];
+            let mut rx_buffer = [0; 4096];
+            let mut tx_meta = [PacketMetadata::EMPTY; 16];
+            let mut tx_buffer = [0; 4096];
+            let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buffer, &mut tx_meta, &mut tx_buffer);
+            socket.bind(123).unwrap();
+            let socket = UdpSocketWrapper::from(socket);
+            
+            let ntp_context = NtpContext::new(EmbassyTimestampGenerator::default());
+
+            let Ok(ntp_addrs) = stack
+                .dns_query(NTP_SERVER, DnsQueryType::A)
+                .await
+                .map_err(|e: embassy_net::dns::Error| AppError::DNS_ERROR(e))
+                .and_then(|addr| if addr.is_empty() { Err(AppError::EMPTY_DNS) } else { Ok(addr) })
+            else {
+                warn!("failed to resolve ntp server ip");
+                continue;
+            };
+            let addr: IpAddr = ntp_addrs[0].into();
+            let result = get_time(SocketAddr::from((addr, 123)), &socket, ntp_context).await;
+
+            match result {
+                Ok(time) => {
+                    TIME_OFFSET_WATCH.sender().send(time.offset().try_into().expect("ntp offset should be positive"));
+                    info!("time is {}", time);
+                },
+                Err(e) => error!("ntp error: {}", e),
+            };
+
+            Timer::after_secs(60 * 60 * 12).await;
             info!("network still up: {}", stack.is_link_up());
         }
     }
@@ -171,11 +216,13 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
     // a hacky solution would be to keep previous state and only change the digits that are needed
     // a better solution would be to figure out the minimum segment change for the digit and execute those
 
-    // let start = Instant::now();
-    let offset: u64 = 1792679109000;
     loop {
-        let now = Instant::now().as_millis() + offset;
-        let now = DateTime::from_timestamp_millis(now.try_into().unwrap()).unwrap();
+        let Some(offset) = TIME_OFFSET_WATCH.receiver().unwrap().try_get() else {
+            Timer::after_secs(1).await;
+            continue;
+        };
+        let now = Instant::now().as_micros() + offset;
+        let now = DateTime::from_timestamp_micros(now.try_into().unwrap()).unwrap();
         let now = now.with_timezone(&chrono_tz::US::Eastern);
 
         // defmt::info!("now is {}", now);
@@ -197,6 +244,7 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
         set_decimal = !set_decimal;
     }
 }
+
 // #[embassy_executor::task]
 async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2c<'_, I2C0, i2c::Async>>>) -> ! {
     // TODO: implement time-sharing bc gesture engine and ambient light detection
