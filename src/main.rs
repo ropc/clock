@@ -128,8 +128,8 @@ async fn main(spawner: Spawner) -> ! {
     unwrap!(spawner.spawn(net_task(runner)));
     unwrap!(spawner.spawn(time_sync_task(control, stack)));
 
-    let scl = p.PIN_13;
-    let sda = p.PIN_12;
+    let scl = p.PIN_1;
+    let sda = p.PIN_0;
 
     let i2c = I2C_STATIC_CELL.init(I2c::new_async(p.I2C0, scl, sda, Irqs, Default::default()));
     let i2c_ref_cell = I2C_REF_CELL.init(RefCell::new(i2c));
