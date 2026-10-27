@@ -34,7 +34,8 @@ const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
 const TIMEZONE: &str = env!("TIMEZONE");
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
-const AMBIENT_LIGHT_THRESHOLD: u16 = 10;
+const AMBIENT_LIGHT_BRIGHT_THRESHOLD: u16 = 20;
+const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 5;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -336,7 +337,6 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
     sensor.enable_proximity(true).unwrap();
     // sensor.enable_proximity_interrupt(true).unwrap();
 
-    let mut ambient_light_dark_count = 0;
     let mut wakeup_signaled = false;
 
     loop {
@@ -353,27 +353,30 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
         // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
 
         if let Some(value) = proximity_data {
-            if value > 0 && !wakeup_signaled {
+            if value > 5 && !wakeup_signaled {
                 WAKEUP_SIGNAL.signal(());
                 wakeup_signaled = true;
             }
-            if value == 0 && wakeup_signaled {
+            if value <= 5 && wakeup_signaled {
                 wakeup_signaled = false;
             }
         }
 
-        if let Some(value) = light_data && value < AMBIENT_LIGHT_THRESHOLD {
-            // prevent overflows
-            ambient_light_dark_count = i32::max(ambient_light_dark_count + 1, 20);
-        } else {
-            ambient_light_dark_count = 0;
+        if let Some(current_ambient_light) = light_data {
+            let change_to_state = if current_ambient_light > AMBIENT_LIGHT_BRIGHT_THRESHOLD {
+                Some(AmbientLightState::BRIGHT)
+            } else if current_ambient_light < AMBIENT_LIGHT_DARK_THRESHOLD {
+                Some(AmbientLightState::DARK)
+            } else {
+                None
+            };
+
+            let current_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+
+            if let Some(new_state) = change_to_state && new_state != current_state {
+                AMBIENT_LIGHT_STATE.sender().send(new_state);
+            }
         }
 
-        let new_state = if ambient_light_dark_count >= 20 { AmbientLightState::DARK } else { AmbientLightState::BRIGHT };
-        let current_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
-
-        if new_state != current_state {
-            AMBIENT_LIGHT_STATE.sender().send(new_state);
-        }
     }
 }
