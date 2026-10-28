@@ -17,7 +17,7 @@ use embassy_rp::{
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, watch::Watch};
 use embassy_time::{Delay, Duration, Instant, Ticker, Timer };
-use chrono::{DateTime, Timelike};
+use chrono::{DateTime, Datelike, Timelike, Weekday};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
 use four_letter_phat_rs::FourLetterPhat;
@@ -35,7 +35,7 @@ const TIMEZONE: &str = env!("TIMEZONE");
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
 const AMBIENT_LIGHT_BRIGHT_THRESHOLD: u16 = 20;
-const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 5;
+const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 3;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -137,9 +137,13 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut delay = Delay {};
     let sensor = Apds9960Full::new(RefCellDevice::new(i2c_ref_cell), 0x39, &mut delay).unwrap();
-    let display = FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x70).unwrap();
+    let displays = [
+        FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x70).unwrap(),
+        FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x72).unwrap(),
+        FourLetterPhat::new(RefCellDevice::new(i2c_ref_cell), 0x71).unwrap(),
+    ];
 
-    unwrap!(spawner.spawn(display_task(display)));
+    unwrap!(spawner.spawn(display_task(displays)));
 
     human_interface_task(sensor).await;
 }
@@ -230,16 +234,48 @@ fn to_char(num: u32) -> char {
     }
 }
 
+fn format_weekday(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Sun => "Sun",
+        Weekday::Mon => "Mon",
+        Weekday::Tue => "Tue",
+        Weekday::Wed => "Wed",
+        Weekday::Thu => "Thu",
+        Weekday::Fri => "Fri",
+        Weekday::Sat => "Sat",
+    }
+}
+
+fn format_month(month: u32) -> &'static str {
+    match month {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "  ",
+    }
+}
+
 #[embassy_executor::task]
-async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>) {
+async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>; 3]) {
     let mut set_decimal = true;
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
     let mut wakeup_timeout: Option<u64> = None;
     let mut clock_state_receiver = CLOCK_STATE.receiver().unwrap();
     let mut ticker = Ticker::every(Duration::from_secs(1));
 
+    let [mut display0, mut display1, mut display2] = displays;
+
     // show that display is powered on
-    display.set_decimal(0).unwrap();
+    display0.set_decimal(0).unwrap();
 
     loop {
         let state = match select3(clock_state_receiver.changed(), ticker.next(), WAKEUP_SIGNAL.wait()).await {
@@ -258,31 +294,18 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
 
         match state {
             ClockState::PoweredOn => {
-                display.clear_digit(0).unwrap();
-                display.clear_digit(1).unwrap();
-                display.clear_digit(2).unwrap();
-                display.clear_digit(3).unwrap();
-                display.set_decimal(0).unwrap();
-                display.clear_decimal(1).unwrap();
-                display.clear_decimal(2).unwrap();
-                display.clear_decimal(3).unwrap();
+                // initial state; everything else will be off
+                display0.set_decimal(0).unwrap();
             },
             ClockState::WifiConnected => {
-                display.clear_digit(0).unwrap();
-                display.clear_digit(1).unwrap();
-                display.clear_digit(2).unwrap();
-                display.clear_digit(3).unwrap();
-                display.set_decimal(0).unwrap();
-                display.set_decimal(1).unwrap();
-                display.clear_decimal(2).unwrap();
-                display.clear_decimal(3).unwrap();
+                // same here, nothing besides the first decimal will have been written to
+                display0.set_decimal(0).unwrap();
+                display0.set_decimal(1).unwrap();
             },
             ClockState::TimeSynced(offset) => {
                 let now = Instant::now().as_micros();
 
-                display.clear_decimal(0).unwrap();
-                display.clear_decimal(2).unwrap();
-                display.clear_decimal(3).unwrap();
+                display0.clear_decimal(0).unwrap();
 
                 let ambient_light;
                 if let Some(timeout) = wakeup_timeout && now < timeout {
@@ -294,31 +317,38 @@ async fn display_task(mut display: FourLetterPhat<RefCellDevice<'static, &'stati
 
                 match ambient_light {
                     AmbientLightState::DARK => {
-                        display.clear_digit(0).unwrap();
-                        display.clear_digit(1).unwrap();
-                        display.clear_decimal(1).unwrap();
-                        display.clear_digit(2).unwrap();
-                        display.clear_digit(3).unwrap();
-
+                        display0.clear_display().unwrap();
+                        display1.clear_display().unwrap();
+                        display2.clear_display().unwrap();
                     },
                     AmbientLightState::BRIGHT => {
                         let now = DateTime::from_timestamp_micros((now + offset).try_into().unwrap()).unwrap();
                         let now = now.with_timezone(&timezone);
 
-                        // defmt::info!("now is {}", now);
+                        // time display
+                        display0.set_digit(0, to_char(now.hour() / 10)).unwrap();
+                        display0.set_digit(1, to_char(now.hour() % 10)).unwrap();
 
-                        // display.set_dimming(Dimming::BRIGHTNESS_MAX).unwrap();
-                        display.set_digit(0, to_char(now.hour() / 10)).unwrap();
-                        display.set_digit(1, to_char(now.hour() % 10)).unwrap();
-
-                        display.set_digit(2, to_char(now.minute() / 10)).unwrap();
-                        display.set_digit(3, to_char(now.minute() % 10)).unwrap();
+                        display0.set_digit(2, to_char(now.minute() / 10)).unwrap();
+                        display0.set_digit(3, to_char(now.minute() % 10)).unwrap();
 
                         if set_decimal {
-                            display.set_decimal(1).unwrap();
+                            display0.set_decimal(1).unwrap();
                         } else {
-                            display.clear_decimal(1).unwrap();
+                            display0.clear_decimal(1).unwrap();
                         }
+
+                        // date displays
+                        let weekday = format_weekday(now.weekday());
+                        let month = format_month(now.month());
+
+                        for (pos, char) in weekday.chars().chain(month.chars()).enumerate() {
+                            let display = if pos < 4 { &mut display1 } else { &mut display2 };
+                            display.set_digit(pos as u8 % 4, char).unwrap();
+                        }
+
+                        display2.set_digit(2, to_char(now.day() / 10)).unwrap();
+                        display2.set_digit(3, to_char(now.day() % 10)).unwrap();
                     }
                 }
             }
@@ -377,6 +407,5 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
                 AMBIENT_LIGHT_STATE.sender().send(new_state);
             }
         }
-
     }
 }
