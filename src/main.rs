@@ -27,6 +27,8 @@ use sntpc_time_embassy::EmbassyTimestampGenerator;
 use embassy_net::udp::UdpSocket;
 use thiserror::Error;
 use static_cell::StaticCell;
+use crate::ClockState::TimeSynced;
+
 use {defmt_rtt as _, panic_probe as _};
 
 const NETWORK_SSID: &str = env!("NETWORK_SSID");
@@ -209,7 +211,14 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
                     info!("time is {}", time);
                     CLOCK_STATE.sender().send(ClockState::TimeSynced(time.offset().try_into().expect("ntp offset should be positive")));
                 },
-                Err(e) => error!("ntp error: {}", e),
+                Err(e) => {
+                    error!("ntp error: {}", e);
+                    let is_synced = if let Some(TimeSynced(_)) = CLOCK_STATE.try_get() { true } else { false }
+                    if !is_synced {
+                        Timer::after_secs(1).await;
+                        continue;
+                    }
+                },
             };
 
             Timer::after_secs(NTP_SYNC_DELAY_SECONDS).await;
