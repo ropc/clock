@@ -20,7 +20,7 @@ use embassy_time::{Delay, Duration, Instant, Ticker, Timer };
 use chrono::{DateTime, Datelike, Timelike, Weekday};
 use embedded_hal_bus::i2c::RefCellDevice;
 use periph::chips::light::Apds9960Full;
-use four_letter_phat_rs::FourLetterPhat;
+use four_letter_phat_rs::{Dimming, FourLetterPhat};
 use sntpc::{NtpContext, get_time};
 use sntpc_net_embassy::UdpSocketWrapper;
 use sntpc_time_embassy::EmbassyTimestampGenerator;
@@ -38,6 +38,7 @@ const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
 const AMBIENT_LIGHT_BRIGHT_THRESHOLD: u16 = 20;
 const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 3;
+const PROXIMITY_THRESHOLD: u8 = 200;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
@@ -51,11 +52,19 @@ static CLOCK_STATE: Watch<CriticalSectionRawMutex, ClockState, 1> = Watch::new_w
 static AMBIENT_LIGHT_STATE: Watch<CriticalSectionRawMutex, AmbientLightState, 2> = Watch::new();
 static WAKEUP_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-#[derive(Debug, Format, Clone, Copy, Default, PartialEq, Eq)]
-enum AmbientLightState {
-    #[default]
-    BRIGHT,
-    DARK,
+#[derive(Debug, Format, Clone, Copy, PartialEq, Eq)]
+struct AmbientLightState {
+    light_level: u16,
+    is_dark_mode: bool,
+}
+
+impl Default for AmbientLightState {
+    fn default() -> Self {
+        AmbientLightState {
+            light_level: u16::MAX,
+            is_dark_mode: false
+        }
+    }
 }
 
 #[derive(Debug, Format, Clone, Copy)]
@@ -213,7 +222,7 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
                 },
                 Err(e) => {
                     error!("ntp error: {}", e);
-                    let is_synced = if let Some(TimeSynced(_)) = CLOCK_STATE.try_get() { true } else { false }
+                    let is_synced = if let Some(TimeSynced(_)) = CLOCK_STATE.try_get() { true } else { false };
                     if !is_synced {
                         Timer::after_secs(1).await;
                         continue;
@@ -273,6 +282,10 @@ fn format_month(month: u32) -> &'static str {
     }
 }
 
+fn lerp(v0: f32, v1: f32, t: f32) -> f32 {
+    v0 + t * (v1 - v0)
+}
+
 #[embassy_executor::task]
 async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static mut I2c<'static, I2C0, i2c::Async>>>; 3]) {
     let mut set_decimal = true;
@@ -301,6 +314,31 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
             },
         };
 
+        let now = Instant::now().as_micros();
+
+        let ambient_light_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+        // LED brightness is set by interpolating ambient light values
+        let interpolated_level = lerp(0.0, 150.0, ambient_light_state.light_level as f32 / u16::MAX as f32);
+        let clamped_level = (interpolated_level as u8).clamp(0, Dimming::BRIGHTNESS_MAX.bits());
+        let dimming = Dimming::from_u8(clamped_level).unwrap_or_default();
+
+        info!("display ambient light level {}, interpolated_level {}, clamped_level {}, dimming {}",
+            ambient_light_state.light_level, interpolated_level, clamped_level, dimming.bits());
+
+        let timeout_done = wakeup_timeout.map_or(true, |timeout| now > timeout);
+
+        if ambient_light_state.is_dark_mode && timeout_done {
+            display0.clear_display().unwrap();
+            display1.clear_display().unwrap();
+            display2.clear_display().unwrap();
+            wakeup_timeout = None;
+            continue;
+        } else {
+            display0.set_dimming(dimming).unwrap();
+            display1.set_dimming(dimming).unwrap();
+            display2.set_dimming(dimming).unwrap();
+        }
+
         match state {
             ClockState::PoweredOn => {
                 // initial state; everything else will be off
@@ -312,54 +350,36 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
                 display0.set_decimal(1).unwrap();
             },
             ClockState::TimeSynced(offset) => {
-                let now = Instant::now().as_micros();
-
+                // TODO: this should only be necessary at startup/state changes
                 display0.clear_decimal(0).unwrap();
 
-                let ambient_light;
-                if let Some(timeout) = wakeup_timeout && now < timeout {
-                    ambient_light = AmbientLightState::BRIGHT;
+                let now = DateTime::from_timestamp_micros((now + offset).try_into().unwrap()).unwrap();
+                let now = now.with_timezone(&timezone);
+
+                // time display
+                display0.set_digit(0, to_char(now.hour() / 10)).unwrap();
+                display0.set_digit(1, to_char(now.hour() % 10)).unwrap();
+
+                display0.set_digit(2, to_char(now.minute() / 10)).unwrap();
+                display0.set_digit(3, to_char(now.minute() % 10)).unwrap();
+
+                if set_decimal {
+                    display0.set_decimal(1).unwrap();
                 } else {
-                    wakeup_timeout = None;
-                    ambient_light = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+                    display0.clear_decimal(1).unwrap();
                 }
 
-                match ambient_light {
-                    AmbientLightState::DARK => {
-                        display0.clear_display().unwrap();
-                        display1.clear_display().unwrap();
-                        display2.clear_display().unwrap();
-                    },
-                    AmbientLightState::BRIGHT => {
-                        let now = DateTime::from_timestamp_micros((now + offset).try_into().unwrap()).unwrap();
-                        let now = now.with_timezone(&timezone);
+                // date displays
+                let weekday = format_weekday(now.weekday());
+                let month = format_month(now.month());
 
-                        // time display
-                        display0.set_digit(0, to_char(now.hour() / 10)).unwrap();
-                        display0.set_digit(1, to_char(now.hour() % 10)).unwrap();
-
-                        display0.set_digit(2, to_char(now.minute() / 10)).unwrap();
-                        display0.set_digit(3, to_char(now.minute() % 10)).unwrap();
-
-                        if set_decimal {
-                            display0.set_decimal(1).unwrap();
-                        } else {
-                            display0.clear_decimal(1).unwrap();
-                        }
-
-                        // date displays
-                        let weekday = format_weekday(now.weekday());
-                        let month = format_month(now.month());
-
-                        for (pos, char) in weekday.chars().chain(month.chars()).enumerate() {
-                            let display = if pos < 4 { &mut display1 } else { &mut display2 };
-                            display.set_digit(pos as u8 % 4, char).unwrap();
-                        }
-
-                        display2.set_digit(2, to_char(now.day() / 10)).unwrap();
-                        display2.set_digit(3, to_char(now.day() % 10)).unwrap();
-                    }
+                for (pos, char) in weekday.chars().chain(month.chars()).enumerate() {
+                    let display = if pos < 4 { &mut display1 } else { &mut display2 };
+                    display.set_digit(pos as u8 % 4, char).unwrap();
                 }
+
+                display2.set_digit(2, to_char(now.day() / 10)).unwrap();
+                display2.set_digit(3, to_char(now.day() % 10)).unwrap();
             }
         }
     }
@@ -374,45 +394,54 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
     // sensor.enable_gesture_interrupt(true).unwrap();
 
     sensor.enable_proximity(true).unwrap();
-    // sensor.enable_proximity_interrupt(true).unwrap();
+
+    // proximity config explanation:
+    //  ldrive: 0   == 100 mA (max)
+    //  pgain:  3   == 8x gain
+    //  ppulse: 16  == 16 pulses
+    //  pplen:  2   == 16us pulse length
+    sensor.configure_proximity_led(0, 3, 16, 2).unwrap();
+
+    // ALS config explanation:
+    //  atime:  0   == 712 ms integration time (max "exposure" time)
+    //  again:  3   == 64x gain
+    sensor.configure_als(0, 3).unwrap();
 
     let mut wakeup_signaled = false;
 
     loop {
         // defmt::info!("Blink");
         // Timer::after(Duration::from_millis(20)).await;
-        Timer::after_millis(50).await;
+        Timer::after_millis(20).await;
 
-        let mut gesture_data_buf = [(0, 0, 0, 0); 1];
+        // let mut gesture_data_buf = [(0, 0, 0, 0); 1];
         
-        let gesture_data = sensor.read_gesture_fifo(&mut gesture_data_buf).ok();
+        // let gesture_data = sensor.read_gesture_fifo(&mut gesture_data_buf).ok();
         let proximity_data = sensor.proximity().ok();
         let light_data = sensor.color_clear().ok();
 
         // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
 
         if let Some(value) = proximity_data {
-            if value > 5 && !wakeup_signaled {
+            if value > PROXIMITY_THRESHOLD && !wakeup_signaled {
                 WAKEUP_SIGNAL.signal(());
                 wakeup_signaled = true;
             }
-            if value <= 5 && wakeup_signaled {
+            if value < PROXIMITY_THRESHOLD && wakeup_signaled {
                 wakeup_signaled = false;
             }
         }
 
-        if let Some(current_ambient_light) = light_data {
-            let change_to_state = if current_ambient_light > AMBIENT_LIGHT_BRIGHT_THRESHOLD {
-                Some(AmbientLightState::BRIGHT)
-            } else if current_ambient_light < AMBIENT_LIGHT_DARK_THRESHOLD {
-                Some(AmbientLightState::DARK)
-            } else {
-                None
-            };
-
+        if let Some(new_light_level) = light_data {
             let current_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
 
-            if let Some(new_state) = change_to_state && new_state != current_state {
+            let new_state = AmbientLightState {
+                light_level: new_light_level,
+                is_dark_mode: (new_light_level < AMBIENT_LIGHT_DARK_THRESHOLD || current_state.is_dark_mode)
+                    && !(new_light_level > AMBIENT_LIGHT_BRIGHT_THRESHOLD),
+            };
+
+            if new_state != current_state {
                 AMBIENT_LIGHT_STATE.sender().send(new_state);
             }
         }
