@@ -36,8 +36,9 @@ const NETWORK_PASSWORD: &str = env!("NETWORK_PASSWORD");
 const TIMEZONE: &str = env!("TIMEZONE");
 const NTP_SERVER: &str = "pool.ntp.org";
 const NTP_SYNC_DELAY_SECONDS: u64 = 60 * 60 * 12;  // 12 hours in seconds
-const AMBIENT_LIGHT_BRIGHT_THRESHOLD: u16 = 20;
-const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 3;
+const AMBIENT_LIGHT_BRIGHT_THRESHOLD: u16 = 500;
+const AMBIENT_LIGHT_DARK_THRESHOLD: u16 = 100;
+const AMBIENT_LIGHT_EXPECTED_MAX: f32 = 20_000.0;
 const PROXIMITY_THRESHOLD: u8 = 200;
 
 bind_interrupts!(struct Irqs {
@@ -318,12 +319,12 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
 
         let ambient_light_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
         // LED brightness is set by interpolating ambient light values
-        let interpolated_level = lerp(0.0, 150.0, ambient_light_state.light_level as f32 / u16::MAX as f32);
-        let clamped_level = (interpolated_level as u8).clamp(0, Dimming::BRIGHTNESS_MAX.bits());
-        let dimming = Dimming::from_u8(clamped_level).unwrap_or_default();
+        let lerp_t = (ambient_light_state.light_level as f32 / AMBIENT_LIGHT_EXPECTED_MAX).clamp(0.0, 1.0);
+        let interpolated_level = lerp(0.0, Dimming::BRIGHTNESS_MAX.bits() as f32, lerp_t);
+        let dimming = Dimming::from_u8(interpolated_level as u8).unwrap_or_default();
 
-        info!("display ambient light level {}, interpolated_level {}, clamped_level {}, dimming {}",
-            ambient_light_state.light_level, interpolated_level, clamped_level, dimming.bits());
+        info!("display ambient light level: {}, t: {}, interpolated_level: {}, dimming {}",
+            ambient_light_state.light_level, lerp_t, interpolated_level, dimming.bits());
 
         let timeout_done = wakeup_timeout.map_or(true, |timeout| now > timeout);
 
@@ -420,7 +421,7 @@ async fn human_interface_task(mut sensor: Apds9960Full<RefCellDevice<'_, &mut I2
         let proximity_data = sensor.proximity().ok();
         let light_data = sensor.color_clear().ok();
 
-        // info!("gesture data: {}\tproximity data: {}\tlight data: {}", gesture_data, proximity_data, light_data);
+        // info!("proximity data: {}\tlight data: {}", proximity_data, light_data);
 
         if let Some(value) = proximity_data {
             if value > PROXIMITY_THRESHOLD && !wakeup_signaled {
