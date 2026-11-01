@@ -7,7 +7,7 @@ use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use embassy_net::{Config, Stack, StackResources, dns::DnsQueryType, udp::PacketMetadata};
 use embassy_rp::{
     bind_interrupts, clocks::RoscRng, dma,
@@ -78,9 +78,9 @@ enum ClockState {
 #[derive(Error, Debug, Format)]
 enum AppError {
     #[error("Empty DNS response")]
-    EMPTY_DNS,
+    EmptyDns,
     #[error("DNS error")]
-    DNS_ERROR(embassy_net::dns::Error),
+    DnsError(embassy_net::dns::Error),
 }
 
 #[embassy_executor::main]
@@ -194,6 +194,9 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
         CLOCK_STATE.sender().send(ClockState::WifiConnected);
 
         loop {
+            if !stack.is_link_up() || !stack.is_config_up() {
+                continue;  // trigger reconnect
+            }
             let mut rx_meta = [PacketMetadata::EMPTY; 16];
             let mut rx_buffer = [0; 4096];
             let mut tx_meta = [PacketMetadata::EMPTY; 16];
@@ -207,8 +210,8 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
             let Ok(ntp_addrs) = stack
                 .dns_query(NTP_SERVER, DnsQueryType::A)
                 .await
-                .map_err(|e: embassy_net::dns::Error| AppError::DNS_ERROR(e))
-                .and_then(|addr| if addr.is_empty() { Err(AppError::EMPTY_DNS) } else { Ok(addr) })
+                .map_err(|e: embassy_net::dns::Error| AppError::DnsError(e))
+                .and_then(|addr| if addr.is_empty() { Err(AppError::EmptyDns) } else { Ok(addr) })
             else {
                 warn!("failed to resolve ntp server ip");
                 continue;
@@ -293,7 +296,9 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
     let timezone = chrono_tz::Tz::from_str(TIMEZONE).expect("invalid timezone");
     let mut wakeup_timeout: Option<u64> = None;
     let mut clock_state_receiver = CLOCK_STATE.receiver().unwrap();
-    let mut ticker = Ticker::every(Duration::from_secs(1));
+    let mut seconds_ticker = Ticker::every(Duration::from_secs(1));
+    // set to sensor integration time
+    let mut dimming_ticker = Ticker::every(Duration::from_millis(712));
 
     let [mut display0, mut display1, mut display2] = displays;
 
@@ -301,58 +306,60 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
     display0.set_decimal(0).unwrap();
 
     loop {
-        let state = match select3(clock_state_receiver.changed(), ticker.next(), WAKEUP_SIGNAL.wait()).await {
-            Either3::First(state) => state,
-            Either3::Second(_) => {
-                set_decimal = !set_decimal;
-                clock_state_receiver.get().await
+        match select4(clock_state_receiver.changed(), WAKEUP_SIGNAL.wait(), dimming_ticker.next(), seconds_ticker.next()).await {
+            // state change
+            Either4::First(new_state) => match new_state {
+                ClockState::PoweredOn => (),  // initial state; will not be changed to
+                ClockState::WifiConnected => {
+                    // nothing besides the first decimal will have been written to
+                    display0.set_decimal(0).unwrap();
+                    display0.set_decimal(1).unwrap();
+                },
+                ClockState::TimeSynced(_) => {
+                    display0.clear_decimal(0).unwrap();
+                    seconds_ticker.reset_at(Instant::now() - Duration::from_secs(1));  // trigger display update
+                },
             },
-            Either3::Third(_) => {
+            // wakeup received
+            Either4::Second(_) => {
                 info!("wakeup received");
                 // timeout 3 seconds from now
                 wakeup_timeout = Some(Instant::now().as_micros() + 3_000_000);
-                clock_state_receiver.get().await
+                seconds_ticker.reset_at(Instant::now() - Duration::from_secs(1));  // trigger display update
             },
-        };
+            // dimming tick
+            Either4::Third(_) => {
+                // TODO: create smooth transitions for this only incrementing/decrementing the brightness by one
+                // even better if there's a second or two delay so that a better target value is reached
+                // this way it can run at 30fps
 
-        let now = Instant::now().as_micros();
+                let ambient_light_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+                // LED brightness is set by interpolating ambient light values
+                let lerp_t = (ambient_light_state.light_level as f32 / AMBIENT_LIGHT_EXPECTED_MAX).clamp(0.0, 1.0);
+                let interpolated_level = lerp(0.0, Dimming::BRIGHTNESS_MAX.bits() as f32, lerp_t);
+                let dimming = Dimming::from_u8(interpolated_level as u8).unwrap_or_default();
 
-        let ambient_light_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
-        // LED brightness is set by interpolating ambient light values
-        let lerp_t = (ambient_light_state.light_level as f32 / AMBIENT_LIGHT_EXPECTED_MAX).clamp(0.0, 1.0);
-        let interpolated_level = lerp(0.0, Dimming::BRIGHTNESS_MAX.bits() as f32, lerp_t);
-        let dimming = Dimming::from_u8(interpolated_level as u8).unwrap_or_default();
-
-        info!("display ambient light level: {}, t: {}, interpolated_level: {}, dimming {}",
-            ambient_light_state.light_level, lerp_t, interpolated_level, dimming.bits());
-
-        let timeout_done = wakeup_timeout.map_or(true, |timeout| now > timeout);
-
-        if ambient_light_state.is_dark_mode && timeout_done {
-            display0.clear_display().unwrap();
-            display1.clear_display().unwrap();
-            display2.clear_display().unwrap();
-            wakeup_timeout = None;
-            continue;
-        } else {
-            display0.set_dimming(dimming).unwrap();
-            display1.set_dimming(dimming).unwrap();
-            display2.set_dimming(dimming).unwrap();
-        }
-
-        match state {
-            ClockState::PoweredOn => {
-                // initial state; everything else will be off
-                display0.set_decimal(0).unwrap();
+                display0.set_dimming(dimming).unwrap();
+                display1.set_dimming(dimming).unwrap();
+                display2.set_dimming(dimming).unwrap();
             },
-            ClockState::WifiConnected => {
-                // same here, nothing besides the first decimal will have been written to
-                display0.set_decimal(0).unwrap();
-                display0.set_decimal(1).unwrap();
-            },
-            ClockState::TimeSynced(offset) => {
-                // TODO: this should only be necessary at startup/state changes
-                display0.clear_decimal(0).unwrap();
+            // seconds tick
+            Either4::Fourth(_) => {
+                let Some(ClockState::TimeSynced(offset)) = clock_state_receiver.try_get() else {
+                    continue;
+                };
+
+                let now = Instant::now().as_micros();
+                let ambient_light_state = AMBIENT_LIGHT_STATE.try_get().unwrap_or_default();
+                let timeout_done = wakeup_timeout.map_or(true, |timeout| now > timeout);
+
+                if ambient_light_state.is_dark_mode && timeout_done {
+                    display0.clear_display().unwrap();
+                    display1.clear_display().unwrap();
+                    display2.clear_display().unwrap();
+                    wakeup_timeout = None;
+                    continue;
+                }
 
                 let now = DateTime::from_timestamp_micros((now + offset).try_into().unwrap()).unwrap();
                 let now = now.with_timezone(&timezone);
@@ -381,8 +388,11 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
 
                 display2.set_digit(2, to_char(now.day() / 10)).unwrap();
                 display2.set_digit(3, to_char(now.day() % 10)).unwrap();
-            }
-        }
+
+                // toggle decimal for next second
+                set_decimal = !set_decimal;
+            },
+        };
     }
 }
 
