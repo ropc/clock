@@ -27,7 +27,6 @@ use sntpc_time_embassy::EmbassyTimestampGenerator;
 use embassy_net::udp::UdpSocket;
 use thiserror::Error;
 use static_cell::StaticCell;
-use crate::ClockState::TimeSynced;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -226,7 +225,7 @@ async fn time_sync_task(mut control: Control<'static>, stack: Stack<'static>) {
                 },
                 Err(e) => {
                     error!("ntp error: {}", e);
-                    let is_synced = if let Some(TimeSynced(_)) = CLOCK_STATE.try_get() { true } else { false };
+                    let is_synced = if let Some(ClockState::TimeSynced(_)) = CLOCK_STATE.try_get() { true } else { false };
                     if !is_synced {
                         Timer::after_secs(1).await;
                         continue;
@@ -297,8 +296,9 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
     let mut wakeup_timeout: Option<u64> = None;
     let mut clock_state_receiver = CLOCK_STATE.receiver().unwrap();
     let mut seconds_ticker = Ticker::every(Duration::from_secs(1));
-    // set to sensor integration time
-    let mut dimming_ticker = Ticker::every(Duration::from_millis(712));
+    // smooth transition between brightness within one second: 1s / 16 (brightness steps) == 62ms
+    let mut dimming_ticker = Ticker::every(Duration::from_millis(62));
+    let mut current_brightness = Dimming::default();
 
     let [mut display0, mut display1, mut display2] = displays;
 
@@ -337,11 +337,18 @@ async fn display_task(displays: [FourLetterPhat<RefCellDevice<'static, &'static 
                 // LED brightness is set by interpolating ambient light values
                 let lerp_t = (ambient_light_state.light_level as f32 / AMBIENT_LIGHT_EXPECTED_MAX).clamp(0.0, 1.0);
                 let interpolated_level = lerp(0.0, Dimming::BRIGHTNESS_MAX.bits() as f32, lerp_t);
-                let dimming = Dimming::from_u8(interpolated_level as u8).unwrap_or_default();
+                let ideal_brightness = Dimming::from_u8(interpolated_level as u8).unwrap_or_default();
 
-                display0.set_dimming(dimming).unwrap();
-                display1.set_dimming(dimming).unwrap();
-                display2.set_dimming(dimming).unwrap();
+                let next_offset = (ideal_brightness.bits() as i8 - current_brightness.bits() as i8).clamp(-1, 1);
+                let next_brightness = Dimming::from_u8((current_brightness.bits() as i8 + next_offset).clamp(0, 16) as u8).unwrap_or_default();
+                if current_brightness == next_brightness {
+                    continue;  // no need to communicate with display
+                }
+
+                display0.set_dimming(next_brightness).unwrap();
+                display1.set_dimming(next_brightness).unwrap();
+                display2.set_dimming(next_brightness).unwrap();
+                current_brightness = next_brightness;
             },
             // seconds tick
             Either4::Fourth(_) => {
